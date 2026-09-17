@@ -1,0 +1,47 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: auditoria-canary
+  namespace: corefid
+  annotations:
+    corefid.io/runbook: "DECISIONES.md#4-plan-de-corte"
+spec:
+  parentRefs:
+    - name: corefid-gateway
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - api.corefid.local
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /api/auditoria/
+      backendRefs:
+        - kind: Service
+          name: auditoria-api
+          port: 80
+          weight: 10
+        - group: ""
+          kind: Service
+          name: monolito-corefid
+          namespace: legacy
+          port: 443
+          weight: 90
+      timeouts:
+        request: 10s
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: permitir-corefid-a-legacy
+  namespace: legacy
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: corefid
+  to:
+    - group: ""
+      kind: Service
+      name: monolito-corefid

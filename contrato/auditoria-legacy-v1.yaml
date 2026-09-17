@@ -1,0 +1,95 @@
+openapi: 3.0.3
+info:
+  title: CORE-FID API - Módulo Auditoría (contrato vigente en producción)
+  description: >
+    Contrato que hoy expone el monolito CORE-FID. Los consumidores actuales son
+    la app móvil, el motor BPM y tres procesos batch internos.
+    EL MICROSERVICIO NUEVO DEBE RESPETAR ESTE CONTRATO EXACTAMENTE.
+    Cambiar el contrato y extraer el módulo son dos cambios independientes.
+  version: "1.0"
+servers:
+  - url: https://api.corefid.local
+paths:
+  /api/auditoria/registro:
+    post:
+      summary: Registra un evento de auditoría
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegistroAuditoriaRequest' }
+      responses:
+        '200':
+          description: Respuesta estándar de la plataforma (incluye errores de negocio)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseCreateLong' }
+        '400': { description: Petición inválida }
+        '401': { description: No autenticado }
+  /api/auditoria/consulta:
+    get:
+      summary: Consulta registros de auditoría
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - { name: codigoEmpresa, in: query, required: true,  schema: { type: string } }
+        - { name: usuario,       in: query, required: false, schema: { type: string } }
+        - { name: entidad,       in: query, required: false, schema: { type: string } }
+        - { name: fechaDesde,    in: query, required: false, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: Lista de registros
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResponseCreateList' }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  schemas:
+    RegistroAuditoriaRequest:
+      type: object
+      required: [codigoEmpresa, usuario, entidad, claveEntidad, accion]
+      properties:
+        codigoEmpresa:     { type: string, maxLength: 4,  example: "0001" }
+        codigoModulo:      { type: string, maxLength: 2,  example: "06", description: "00-99, subsistema" }
+        codigoTransaccion: { type: string, maxLength: 10, example: "V062014" }
+        usuario:           { type: string, maxLength: 30, example: "jperez" }
+        entidad:           { type: string, maxLength: 60, example: "SolicitudRescate" }
+        claveEntidad:      { type: string, maxLength: 60, example: "RES-2026-004871" }
+        accion:            { type: string, enum: [C, U, D, Q], example: "U" }
+        valorAnterior:     { type: string, description: "Snapshot JSON previo (requerido si accion=U)" }
+        valorNuevo:        { type: string, description: "Snapshot JSON posterior" }
+        direccionIp:       { type: string, example: "10.0.4.77" }
+        canal:             { type: string, enum: [WEB, API, BATCH], default: "WEB" }
+    ResponseCreateLong:
+      type: object
+      properties:
+        codigo:  { type: string, example: "OK", description: "OK | E01..E05 | E10 | E99" }
+        mensaje: { type: string, example: "Registro creado." }
+        detalle: { type: string, nullable: true }
+        data:    { type: integer, format: int64, example: 884213 }
+    ResponseCreateList:
+      type: object
+      properties:
+        codigo:  { type: string, example: "OK" }
+        mensaje: { type: string }
+        detalle: { type: string, nullable: true }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/RegistroAuditoria' }
+    RegistroAuditoria:
+      type: object
+      properties:
+        id:                { type: integer, format: int64 }
+        codigoEmpresa:     { type: string }
+        codigoModulo:      { type: string }
+        codigoTransaccion: { type: string }
+        usuario:           { type: string }
+        entidad:           { type: string }
+        claveEntidad:      { type: string }
+        accion:            { type: string }
+        valorAnterior:     { type: string }
+        valorNuevo:        { type: string }
+        direccionIp:       { type: string }
+        canal:             { type: string }
+        fechaRegistro:     { type: string, format: date-time }

@@ -2,42 +2,58 @@
 
 ## 1. Hallazgos en el código legacy
 
-Ordenados por impacto. Indico cómo quedó cada uno en el microservicio.
+Durante la revisión del código legacy encontré los siguientes problemas. Los ordené según su impacto y, en cada caso, indico cómo quedaron en el microservicio.
 
-| # | Problema | Dónde | Estado |
+| # | Problema | Ubicación | Estado en el microservicio |
 |---|---|---|---|
-| 1 | **Correo dentro del `TransactionScope`.** Si `ts.Complete()` falla, ya se notificó una acción que no quedó registrada; si el SMTP tarda, Oracle retiene los locks toda la espera. | `BAuditoria.Registrar` | **Resuelto** con Outbox (§3). |
-| 2 | **SQL por concatenación.** Inyección en `usuario`, `entidad`, `claveEntidad` y los snapshots JSON; `usuario=x' OR '1'='1` devuelve toda la tabla. | `EAuditoria.Insertar/Buscar` | **Resuelto.** EF Core parametriza; hay prueba de integración con ese payload. |
-| 3 | **Credenciales en el código** (`COREFID / Cor3F1d$2019 / 10.0.2.31`) en un `const` usado por ~40 módulos. | `ADOracle` | **Resuelto.** Variables de entorno; en K8s, `Secret`. Esa contraseña hay que rotarla hoy, sin esperar la migración. |
-| 4 | **`catch` que devuelve `Ok("OK","Procesado")`.** Un fallo se reporta como éxito: pérdida silenciosa de evidencia en el módulo que existe para no perderla. | `AuditoriaController.Registrar` | **Resuelto.** Fallo inesperado → `500 E99` (única desviación deliberada, §2). |
-| 5 | **`SELECT *` sin límite.** Sin `fechaDesde` trae la tabla entera. | `EAuditoria.Buscar` | **Parcial.** Índices `(empresa, fecha DESC)` y `(empresa, usuario)`; límite configurable `Consulta:MaximoResultados`, apagado por defecto para no alterar a los batch. Paginar exige contrato v2. |
-| 6 | **Conexiones sin `using`/`finally`**: en excepción no se cierran, fuga del pool. | `EAuditoria` | Resuelto por diseño (`DbContext` scoped). |
-| 7 | **`out string error` descartado** en `Consultar`: una caída de BD devuelve `[]`, indistinguible de "sin datos". | `BAuditoria.Consultar` | **Resuelto.** La query lanza; el cliente recibe `500 E99`, nunca `[]`. |
-| 8 | **`DateTime.Now`**: hora local del servidor, no inyectable; rompe rangos multi-zona y hace el handler no determinista. | `BAuditoria.Registrar` | **Resuelto.** `TimeProvider` inyectado, `timestamptz` UTC. |
-| 9 | **Regla de negocio en el controlador** (`BATCH`+`Q` → `E10`). Es la más fácil de perder al migrar. | `AuditoriaController` | **Resuelto.** Vive en el agregado, evaluada primero, como en el legacy. |
-| 10 | **API sin versionar** y **`StackTrace` al cliente** en el 500. | `AuditoriaController` | Ruta no cambiada (rompería consumidores); `StackTrace` sustituido por `traceId`. |
+| 1 | **Envío de correos dentro de `TransactionScope`.** El correo se envía antes de confirmar la transacción. Si `ts.Complete()` falla, se notifica una acción que finalmente no quedó registrada. Y si el SMTP tarda en responder, la transacción de Oracle mantiene los locks durante toda la espera. | `BAuditoria.Registrar` | **Resuelto** mediante Outbox (ver punto 3). |
+| 2 | **SQL construido por concatenación.** Permite inyección en `usuario`, `entidad`, `claveEntidad` y los snapshots JSON. Un valor como `usuario=x' OR '1'='1` devuelve registros que no corresponden a la consulta. | `EAuditoria.Insertar/Buscar` | **Resuelto.** EF Core usa consultas parametrizadas. Hay una prueba de integración con ese mismo payload. |
+| 3 | **Credenciales en el código.** Usuario, contraseña e IP de Oracle (`COREFID / Cor3F1d$2019 / 10.0.2.31`) en un `const` que usan unos 40 módulos. | `ADOracle` | **Resuelto.** Variables de entorno y, en Kubernetes, un `Secret`. Esa contraseña debería rotarse hoy, sin esperar a la migración. |
+| 4 | **Un `catch` que devuelve `Ok("OK","Procesado")`.** Cualquier error se reporta como éxito. En un módulo cuya función es conservar evidencia, esto oculta la pérdida de registros. | `AuditoriaController.Registrar` | **Resuelto.** Los errores inesperados devuelven `500 E99`. Es la única desviación deliberada del comportamiento legacy (ver punto 2). |
+| 5 | **`SELECT *` sin límite ni paginación.** Sin `fechaDesde`, la consulta trae toda la tabla. | `EAuditoria.Buscar` | **Parcial.** Índices sobre `(empresa, fecha DESC)` y `(empresa, usuario)`, y un límite configurable `Consulta:MaximoResultados`, desactivado por defecto para no alterar los resultados de los batch. Paginar requiere un contrato v2. |
+| 6 | **Conexiones sin `using` ni `finally`.** Ante una excepción la conexión queda abierta y el pool se agota. | `EAuditoria` | **Resuelto por diseño.** `DbContext` con ciclo de vida scoped. |
+| 7 | **El `out string error` se descarta en `Consultar`.** Una caída de la base de datos devuelve una lista vacía, indistinguible de "no hay datos". | `BAuditoria.Consultar` | **Resuelto.** La consulta propaga la excepción y el cliente recibe `500 E99`, nunca `[]`. |
+| 8 | **`DateTime.Now`.** La hora depende del servidor y no se puede controlar en las pruebas. Complica los rangos entre zonas horarias y hace el handler no determinista. | `BAuditoria.Registrar` | **Resuelto.** `TimeProvider` inyectado y fechas en UTC con `timestamptz`. |
+| 9 | **Regla de negocio en el controlador.** La combinación `BATCH` + `Q` que produce `E10` se evaluaba en el controlador, no en el dominio. Contradice el criterio de controladores delgados y es fácil perderla en una migración. | `AuditoriaController` | **Resuelto.** Vive en el agregado y se evalúa antes que las demás, igual que en el legacy. |
+| 10 | **API sin versionar y `StackTrace` expuesto al cliente.** | `AuditoriaController` | La ruta **no se cambió** porque rompería a los consumidores. El `StackTrace` se reemplazó por un `traceId`. |
 
-Menores: `Canal` se acepta sin validar aunque el contrato lo define como enum; `ENotificacion` acoplado por `new`; `SQ01AUDITORIA.NEXTVAL` se lee en un round-trip separado del `INSERT`.
+Otros puntos menores: `Canal` se acepta sin validar aunque el contrato lo define como enum; `ENotificacion` está acoplado con `new`; la secuencia `SQ01AUDITORIA.NEXTVAL` se consulta en un round-trip separado del `INSERT`.
 
 ## 2. Dónde vive cada regla y por qué
 
-**Invariantes del registro** (`E01`–`E05`, `E10`, canal por defecto `WEB`, cálculo de acción sensible): en `RegistroAuditoria.Registrar(...)`, el único camino para construir la entidad. Son propiedades del registro, no de la petición HTTP: si mañana llega por RabbitMQ o por batch, aplican igual. Se evalúan en el mismo orden que el legacy (`E10` y después `E01`…`E05`) para que un mismo cuerpo produzca el mismo código. `Accion`, `Canal`, `CodigoEmpresa` y `CodigoModulo` son value objects: no existe una instancia inválida.
+### Invariantes del registro
 
-**Validación de formato** (`maxLength`, enum `canal`): en el DTO del API con DataAnnotations → `400 E00 "Petición inválida."`. Es responsabilidad del contrato OpenAPI; el dominio no necesita saber que `codigoEmpresa` mide 4.
+Las reglas `E01` a `E05`, `E10`, el valor por defecto `WEB` y el cálculo de la acción sensible están en `RegistroAuditoria.Registrar(...)`, el único punto autorizado para construir la entidad. Son propiedades del registro, no de la petición HTTP: si mañana el registro llega por RabbitMQ o por un batch, las mismas reglas aplican igual.
 
-**Mapeo a HTTP**: solo en el controller. `E01`–`E05` → `200` (incorrecto, pero es lo que hace producción), `E10`/`E00` → `400`, `E99` → `500`.
+El orden de validación es el del legacy, primero `E10` y después `E01` a `E05`, para que el mismo cuerpo produzca el mismo código. `Accion`, `Canal`, `CodigoEmpresa` y `CodigoModulo` son value objects, así que no se puede crear una instancia inválida.
 
-**Append-only**: el agregado no tiene setters públicos ni métodos de mutación; el repositorio solo expone `Agregar`. El `U`/`D` de `accion` describe la acción auditada, no una operación sobre el registro. Un registro de auditoría no se edita ni se borra; la retención se hace por partición de fecha, no con `DELETE`.
+### Validación de formato
 
-**CQRS**: `RegistrarAuditoriaCommand` pasa por el agregado y el Unit of Work; `ConsultarAuditoriaQuery` lee `AsNoTracking` directo a DTO sin tocar el agregado. Hoy el beneficio es moderado; aparece cuando la reportería sobre millones de filas deje de competir con la escritura fila a fila en Oracle. **Sin MediatR**: dos handlers no justifican una dependencia que además pasó a licencia comercial; `ICommandHandler<,>` e `IQueryHandler<,>` propios en Application, registrados en DI.
+Las restricciones de formato (`maxLength`, el enum de `canal`) se validan en el DTO del API con DataAnnotations y responden `400 E00 "Petición inválida."`. El dominio no necesita saber que `codigoEmpresa` mide cuatro caracteres; eso es responsabilidad del contrato OpenAPI.
 
-**Única desviación de comportamiento**: el legacy responde `200 OK "Procesado"` ante un fallo interno del registro; aquí se responde `500 E99`. `E99` ya existe en el contrato y los consumidores lo manejan en `consulta`. Ocultarlo sería reproducir el defecto #4.
+### Mapeo de códigos a HTTP
 
-## 3. Qué resuelve el Outbox en este caso
+El controlador es el único componente que conoce HTTP. `E01` a `E05` responden `200` (no es lo más correcto, pero es lo que hace producción), `E10` y `E00` responden `400`, y `E99` responde `500`.
 
-En `BAuditoria.Registrar`, dentro del `TransactionScope`, se hace el `INSERT` y luego `EnviarCorreo`. Dos fallos reales: (a) el correo sale y `ts.Complete()` falla → Seguridad recibe una alerta de una acción que no consta en auditoría; (b) el SMTP tarda 30 s → la transacción de Oracle queda abierta con locks sobre `T01AUDITORIA` mientras los tres canales siguen insertando.
+### Append-only
 
-Con el Outbox el command solo escribe en base de datos, y ambas escrituras van en la misma transacción:
+El agregado no expone setters ni métodos que modifiquen sus datos, y el repositorio solo ofrece `Agregar`. Los valores `U` y `D` de `accion` describen la acción que se está auditando, no una operación sobre el registro. Un registro de auditoría no se edita ni se elimina; la retención se gestiona con particiones por fecha, no con `DELETE`.
+
+### CQRS
+
+La escritura usa `RegistrarAuditoriaCommand`, que pasa por el agregado y el Unit of Work. La lectura usa `ConsultarAuditoriaQuery`, que consulta directamente los DTO con `AsNoTracking`, sin cargar el agregado. Por ahora la separación aporta un beneficio moderado; será más evidente cuando la reportería sobre millones de registros compita con las escrituras fila a fila en Oracle.
+
+No uso MediatR. Dos handlers no justifican una dependencia que además cambió a licencia comercial. Definí `ICommandHandler<,>` e `IQueryHandler<,>` propios en Application y los registré en DI.
+
+### Única desviación de comportamiento
+
+En el legacy, un fallo interno durante el registro devuelve `200 OK "Procesado"`. En el microservicio devuelve `500 E99`. El código `E99` ya existe en el contrato y los consumidores lo manejan en `consulta`. Mantener el error oculto habría sido reproducir el defecto 4.
+
+## 3. Qué resuelve el patrón Outbox en este caso
+
+En `BAuditoria.Registrar`, el legacy ejecuta el `INSERT` y después `EnviarCorreo` dentro del mismo `TransactionScope`. Esto genera dos problemas concretos: si el correo sale y `ts.Complete()` falla, Seguridad recibe una alerta sobre una acción que nunca quedó registrada; y si el SMTP tarda 30 segundos, la transacción de Oracle permanece abierta con locks sobre `T01AUDITORIA` mientras los tres canales siguen insertando.
+
+Con el Outbox, el command solo escribe en la base de datos. La auditoría y el mensaje pendiente se guardan dentro de la misma transacción:
 
 ```text
 UnitOfWork.CommitAsync
@@ -48,34 +64,43 @@ UnitOfWork.CommitAsync
     └── Commit
 ```
 
-Si el commit falla, no queda ni registro ni evento; si pasa, el evento existe y se publicará sí o sí. La prueba `Si_falla_el_insert_del_outbox_tampoco_queda_la_auditoria` lo demuestra forzando el fallo con un interceptor. El correo sale del camino transaccional: lo enviará un consumidor del evento.
+Si el commit falla, no queda ni el registro ni el evento. Si se completa, el evento queda almacenado y se publicará. La prueba `Si_falla_el_insert_del_outbox_tampoco_queda_la_auditoria` verifica este comportamiento forzando un fallo en el insert del Outbox mediante un interceptor. El envío del correo deja de ser parte del camino transaccional; será responsabilidad de un consumidor del evento.
 
-El `OutboxDispatcher` (`BackgroundService`) toma pendientes con `FOR UPDATE SKIP LOCKED` (varias réplicas sin duplicar), publica, marca `processed_at`; en fallo incrementa `attempts`, guarda `error` y aplica backoff exponencial de 5 a 300 s. El broker caído no afecta al API ni a `/readyz`; se verificó deteniendo RabbitMQ. Semántica **at-least-once**: el consumidor deduplica por `EventId`, que viaja como `MessageId` de AMQP.
+El `OutboxDispatcher`, un `BackgroundService`, obtiene los pendientes con `FOR UPDATE SKIP LOCKED` (varias réplicas sin procesar el mismo mensaje), publica, y marca `processed_at`. Si falla, incrementa `attempts`, guarda el detalle en `error` y aplica un backoff exponencial de 5 a 300 segundos. La caída del broker no afecta al API ni a `/readyz`; lo verifiqué deteniendo RabbitMQ. La entrega es at-least-once, así que el consumidor debe deduplicar por `EventId`, que viaja como `MessageId` de AMQP.
 
-## 4. Plan de corte de `/api/auditoria/**`
+## 4. Plan de migración de `/api/auditoria/**`
 
-1. **No-prod primero.** Shadow traffic una semana en QA comparando monolito y servicio: código HTTP, cuerpo y conteo de registros por día. El criterio de aborto se escribe antes de empezar: 5xx > 0,5 % sostenido 5 min, p95 > 300 ms, más de 500 pendientes en el outbox, o diferencia > 0,1 % en el conteo de registros por hora.
-2. **Canary con el `HTTPRoute`** de `deploy/k8s/20-httproute-canary.yaml`: 10 % servicio / 90 % monolito durante 24 h; luego 25 → 50 → 100 %, cada paso con un merge en GitOps y las mismas métricas.
-3. **Qué se mira**: tasa de error y latencia por backend en el gateway; pendientes y `attempts > 3` en `outbox_messages`; y una comparación de datos: conteo por hora y checksum de `(empresa, usuario, entidad, clave, accion)` entre ambos lados. Un `200` no basta: el monolito guarda hora de Quito y el servicio UTC; si los rangos por fecha divergen, se ve aquí y no en un dashboard de códigos.
-4. **Rollback** = PR en GitOps que pone el peso del servicio en `0`. Segundos, sin redeploy, sin tocar el monolito. A las 3 a. m. con registros duplicados: primero peso a 0, después se investiga.
-5. **Doble escritura.** Durante el canary ambos escriben en la misma tabla Oracle; los registros se complementan (cada petición la atiende uno). Antes de pasar del 10 % hay que resolver: (a) `SQ01AUDITORIA.NEXTVAL` debe seguir siendo la fuente del `id` en el servicio mientras convivan (EF `UseSequence`); (b) la fecha se normaliza a UTC en el servicio y se convierte al leer, o los consumidores verán saltos de cinco horas.
+**Validación previa.** Shadow traffic durante una semana en QA, comparando monolito y microservicio en código HTTP, cuerpo y conteo de registros por día. El criterio de aborto queda por escrito antes de empezar: 5xx por encima del 0,5 % durante cinco minutos, p95 superior a 300 ms, más de 500 mensajes pendientes en el Outbox, o más del 0,1 % de diferencia en el conteo de registros por hora.
 
-## 5. Qué queda fuera y qué haría con dos días más
+**Canary progresivo.** Con el `HTTPRoute` de `deploy/k8s/20-httproute-canary.yaml`: 10 % al microservicio y 90 % al monolito durante 24 horas; después 25 %, 50 % y 100 %. Cada cambio es un merge en GitOps y se revisa con las mismas métricas.
 
-- **Oracle real**: provider `Oracle.EntityFrameworkCore`, mapeo a `T01AUDITORIA`, `UseSequence("SQ01AUDITORIA")`. PostgreSQL es un sustituto.
-- **Consumidor del evento** que envíe el correo a Seguridad, con deduplicación por `EventId` y DLQ.
-- **Paginación y `fechaHasta`** en un contrato v2 (`/api/v1/auditoria`), conviviendo con v1 en el gateway y con plan de deprecación para móvil, BPM y batch.
-- **Retención**: particionado mensual por `fecha_registro` y archivado; hoy solo hay índices.
-- **CI/CD**: `dotnet test`, build y escaneo de imagen; Helm chart en lugar de YAML plano; NetworkPolicies y `ServiceMonitor`.
-- **OpenTelemetry** (P2 #14): trazas ASP.NET Core y Npgsql, métricas de runtime exportadas por OTLP, y métricas propias `outbox_pendientes` y `outbox_attempts`, que son las que alimentan el criterio de aborto del canary. El `traceId` W3C ya viaja en los logs vía `Activity.Current`, así que se enchufa sin tocar el código de negocio.
+**Qué se mira.** Tasa de errores y latencia de cada backend en el gateway; pendientes y mensajes con `attempts > 3` en `outbox_messages`; conteo de registros por hora en ambos lados y un checksum de `(empresa, usuario, entidad, clave, accion)`. Un `200` no garantiza nada: el monolito registra hora de Quito y el servicio UTC, y si los rangos no se normalizan aparecen diferencias en las consultas con códigos HTTP correctos. La comparación de datos las detecta antes de que las vean los consumidores.
 
-## 6. Uso de IA
+**Rollback.** Un PR en GitOps que pone el peso del microservicio en `0`. Segundos, sin redeploy y sin tocar el monolito. Durante un incidente la prioridad es detener el problema y después investigar: si a las 3 de la mañana aparecen registros duplicados, primero peso a `0`, luego se analiza.
 
-Trabajé con **Claude Code** como pair programmer, partiendo de una especificación (este documento y el plan de capas) antes del código. Generé con él el esqueleto, las configuraciones EF, el dispatcher, los manifiestos de Kubernetes y la primera versión de las pruebas. Lo que tuve que corregir:
+**Convivencia.** Durante el canary ambos escriben en la misma tabla Oracle; los registros se complementan porque cada petición la atiende uno de los dos. Antes de pasar del 10 % hay que resolver dos cosas: `SQ01AUDITORIA.NEXTVAL` debe seguir siendo la fuente del `id` en el microservicio (EF con `UseSequence`), y las fechas deben guardarse en UTC y convertirse al leer, o los consumidores verán diferencias de cinco horas.
 
-- **Dispatcher vs. reintentos de EF.** Abría una transacción manual con `EnableRetryOnFailure` activo. Compilaba y las pruebas pasaban porque el factory de tests reemplazaba el `DbContext` sin retry; falló en el `docker compose` real. Lo detecté en el smoke test, lo envolví en `CreateExecutionStrategy()` y alineé el factory con la configuración real.
-- **`CodigoModulo` como `record struct`.** EF no puede mapear un struct a columna nullable y la migración salió `NOT NULL`. Pasó a `record` de referencia con `Desde()` que devuelve `null`.
-- **Proyección LINQ** que accedía a `.Valor` de los value objects dentro del `Select`: no traducible a SQL. Se materializa y se mapea en memoria.
-- **Pruebas del outbox** que reseteaban `FakeTimeProvider` hacia atrás (lanza). Se reescribieron relativas al "ahora" del reloj.
-- **Helper de tokens** que generaba `nbf` posterior a `exp` en el caso "expirado"; la librería lo rechazaba antes de llegar al API.
-- **Organización.** La primera estructura tendía a un archivo por interfaz (varios de 6–13 líneas), un `RegistroAuditoriaResponse` que duplicaba el DTO de Application y OpenTelemetry con cinco paquetes. Consolidé puertos, seguridad y configuraciones EF por tema, eliminé el duplicado y dejé OTel como P2 documentado: menos piezas que explicar y defender, mismo comportamiento, mismas 57 pruebas.
+## 5. Qué queda pendiente y qué haría con dos días más
+
+- **Oracle real.** PostgreSQL es un sustituto. Falta el provider `Oracle.EntityFrameworkCore`, el mapeo a `T01AUDITORIA` y `UseSequence("SQ01AUDITORIA")`.
+- **Consumidor del evento** que envíe el correo a Seguridad, con deduplicación por `EventId`, manejo de errores y una Dead Letter Queue.
+- **Paginación y `fechaHasta`** en un contrato v2 (`/api/v1/auditoria`), conviviendo con el actual en el gateway y con un plan de deprecación para móvil, BPM y batch.
+- **Retención.** Particionado mensual por `fecha_registro` y un proceso de archivado. Hoy solo hay índices.
+- **Pipeline y despliegue.** CI con `dotnet test`, build y escaneo de la imagen; Helm chart en lugar de YAML plano; NetworkPolicies y `ServiceMonitor`.
+- **OpenTelemetry** (P2, punto 14). Trazas de ASP.NET Core y Npgsql, métricas de runtime exportadas por OTLP al collector del cluster, y métricas propias `outbox_pendientes` y `outbox_attempts`, que son las que alimentan el criterio de aborto del canary. El `traceId` W3C ya se propaga en los logs con `Activity.Current`, así que la instrumentación entra sin tocar el código de negocio.
+
+## 6. Uso de IA durante el desarrollo
+
+Usé **Claude Code** como asistente de pair programming. Antes de escribir código partí de una especificación formada por este documento y el plan de capas. Con su ayuda generé el esqueleto de la solución, las configuraciones de EF, el dispatcher, los manifiestos de Kubernetes y la primera versión de las pruebas. Aceleró la implementación, pero hubo varias cosas que tuve que revisar y corregir.
+
+**Dispatcher y reintentos de EF Core.** El dispatcher abría una transacción manual con `EnableRetryOnFailure` habilitado. Compilaba y las pruebas pasaban porque el factory de tests reemplazaba el `DbContext` sin la configuración de reintentos, pero fallaba en el `docker compose` real. Lo detecté en el smoke test; envolví la transacción en `CreateExecutionStrategy()` y alineé el factory con la configuración real.
+
+**Mapeo de `CodigoModulo`.** Se había definido como `record struct`. EF no puede mapear un struct a una columna nullable y la migración generó una columna `NOT NULL`. Lo cambié a un `record` de referencia con un `Desde()` que puede devolver `null`.
+
+**Proyección LINQ.** Accedía a `.Valor` de los value objects dentro del `Select`, y esa expresión no se traduce a SQL. Ahora se materializa y se mapea en memoria.
+
+**Pruebas del Outbox.** Reiniciaban el `FakeTimeProvider` hacia atrás, lo que lanza una excepción. Las reescribí con tiempos relativos al momento actual del reloj.
+
+**Helper de tokens.** Generaba un `nbf` posterior a `exp` en el caso del token expirado, y la librería lo rechazaba antes de llegar al API.
+
+**Organización del código.** La primera estructura tendía a un archivo por interfaz, incluso con seis u ocho líneas; había un `RegistroAuditoriaResponse` que duplicaba el DTO de Application y OpenTelemetry repartido en cinco paquetes. Agrupé los puertos, la seguridad y las configuraciones de EF por tema, eliminé el duplicado y dejé OpenTelemetry documentado como P2. Quedó una solución con menos piezas que explicar y mantener, con el mismo comportamiento y las mismas 57 pruebas.
